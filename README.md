@@ -7,6 +7,7 @@ A collection of agent skills for vertical debugging and engineering scenarios. E
 | Skill | Description |
 |---|---|
 | [intermittent-bug-flow](./intermittent-bug-flow/SKILL.md) | Systematic flow for debugging intermittent/probabilistic feature failures in voice/social iOS apps (ObjC & Swift) — flag leaks, same-key early-exits, async races, guard chains, duplicate triggers. Invoke when a feature works sometimes but not always, fails only on re-entry, or fires twice. |
+| [CatAgent](./CatAgent/README.md) | Global agent persona & collaboration rules (`AGENTS.md` for Kimi Code / Claude Code). Forked from [onevcat's gist](https://gist.github.com/onevcat/7c5838349c7264d6019bebe39df30405), locally adapted; this repo is the single source of truth. |
 
 ## Usage
 
