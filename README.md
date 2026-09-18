@@ -6,7 +6,7 @@ A collection of agent skills for vertical debugging and engineering scenarios. E
 
 | Skill | Description |
 |---|---|
-| [intermittent-bug-flow](./intermittent-bug-flow/SKILL.md) | Systematic flow for debugging intermittent/probabilistic feature failures — flag leaks, race conditions, same-key early-exits, guard chains. Invoke when a feature works sometimes but not always, or fails only on re-entry. |
+| [intermittent-bug-flow](./intermittent-bug-flow/SKILL.md) | Systematic flow for debugging intermittent/probabilistic feature failures in voice/social iOS apps (ObjC & Swift) — flag leaks, same-key early-exits, async races, guard chains, duplicate triggers. Invoke when a feature works sometimes but not always, fails only on re-entry, or fires twice. |
 
 ## Usage
 

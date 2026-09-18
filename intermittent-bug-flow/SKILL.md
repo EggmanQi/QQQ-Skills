@@ -1,11 +1,11 @@
 ---
 name: "intermittent-bug-flow"
-description: "Systematic flow for debugging intermittent/probabilistic feature failures (flag leaks, race conditions, guard chains). Invoke when a feature works sometimes but not always, or fails only on re-entry."
+description: "Systematic flow for debugging intermittent/probabilistic feature failures in voice/social iOS apps (ObjC & Swift) — flag leaks, same-key early-exits, async races, guard chains, duplicate triggers. Invoke when a feature works sometimes but not always, fails only on re-entry, or fires twice."
 ---
 
 # Intermittent Bug Investigation Flow
 
-A structured debugging protocol for features that fail **non-deterministically** — works on first run but not on retry, works for others but not the current user, works in one path but not another equivalent path.
+A structured debugging protocol for **non-deterministic** feature failures in voice/social iOS apps (语聊房 / IM 消息 / 礼物特效 / 座驾动效) — works on first run but not on retry, works for other users but not this one, works in one path but not an equivalent one. Applies to both ObjC and Swift codebases.
 
 ---
 
@@ -24,84 +24,108 @@ Goal: produce a **minimal reproduction path** (e.g. "open app → enter room A �
 
 ---
 
-## Phase 2 — Identify Candidate Root Causes
+## Phase 1 — Identify Candidate Root Causes
 
-For iOS/ObjC features that are intermittent, the most common causes in priority order:
+For voice/social iOS features that are intermittent, the most common causes in priority order:
 
 ### 1. Stale In-Memory State / Flag Leak
 - A flag or cached value set during session A is **not cleared** when session A ends.
 - Next session reads the stale value and short-circuits.
-- **Search pattern**: grep for flag setters and check where they are cleared. Look for `dealloc`, `viewWillDisappear`, `exitRoom`-equivalent hooks that should reset them.
+- **Search pattern**: grep for flag setters and check where they are cleared. Look for `dealloc`/`deinit`, `viewWillDisappear`, `exitRoom`-equivalent hooks that should reset them.
 - **Signature**: works on first run (clean state), fails on re-entry.
 
 ### 2. Same-Key Early-Exit in State Managers
 - Shared singletons (e.g. `TurboModeStateManager`) often guard against redundant updates using a "current value unchanged" check.
 - When re-entering the same room/session, the key matches, the update is skipped, and downstream observers never fire.
-- **Search pattern**: grep for `if ([newValue isEqualTo:_currentValue]) return;` patterns in shared manager `set*` methods.
+- **Search pattern**:
+  - ObjC: `if ([newValue isEqualTo:_currentValue]) return;`
+  - Swift: `if newValue == currentValue { return }` / `guard newValue != currentValue else { return }`
 - **Signature**: works when switching between different rooms/sessions, fails when re-entering the same one.
 
 ### 3. Async Race Condition (A beats B)
 - Two async paths (HTTP + WebSocket, or auth + data) converge at a guard. If fast path B arrives before slow path A, it reads `nil`/uninitialized state and returns early — with no retry.
-- **Search pattern**: find the guard condition and trace both paths that populate it. Check if the slower path has a "retry if pending" mechanism.
+- **Search pattern**: find the guard condition and trace both paths that populate it (e.g. `URLSession` callback vs. NIM WebSocket delegate). Check if the slower path has a "retry if pending" mechanism.
 - **Signature**: works when network is slow (HTTP wins), fails when network is fast (WebSocket wins first).
 
 ### 4. Guard Chain Misconfiguration
-- A feature passes through multiple sequential guards (feature flag → room setting → user setting → Turbo mode → playback queue). Any single guard returning early silently blocks the feature.
+- A feature passes through multiple sequential guards (feature flag → room setting → user setting → mode switch → playback queue). Any single guard returning early silently blocks the feature.
 - **Search pattern**: read the full guard chain in order. For each guard, trace what sets it and verify the setter is actually called in your path.
+  - ObjC: grep for early `return;` inside `if` checks.
+  - Swift: grep for `guard ... else { return }`.
 - **Signature**: works for other users (different guard state), fails for this user.
+
+### 5. Duplicate Trigger Paths
+- The feature has **more than one trigger source** — e.g. IM SDK local echo (`onRecvMessages:`) plus send-completion callback, or `NSNotification`/`NotificationCenter` plus a direct delegate call, or `enterRoom` invoked from multiple entry points.
+- Two paths fire in the same session; the second one reads half-initialized state and returns early — so the *apparent* failure is intermittent even though the trigger is not.
+- **Search pattern**: map every call site of the feature's entry method.
+  - ObjC: grep `handleXxx:` / `postNotificationName:` / `addObserver:`.
+  - Swift: grep `handleXxx(` / `NotificationCenter.default.post` / `addObserver`.
+- **Signature**: the feature's entry log appears **≥2 times** for a single user action; or a failing session shows two trigger paths interleaving.
 
 ---
 
-## Phase 3 — Instrumentation Strategy
+## Phase 2 — Instrumentation Strategy
 
 Add targeted logs **at each guard** in the feature's execution path:
 
 ```objc
-// Pattern: log the value at the decision point, not just the outcome
+// ObjC
 NSLog(@"[FeatureName] guard check — key=%@ value=%@ expected=%@", key, actualValue, expectedValue);
+```
+
+```swift
+// Swift
+print("[FeatureName] guard check — key=\(key) value=\(String(describing: actualValue)) expected=\(expectedValue)")
 ```
 
 Key principles:
 - Log **before** the `return` / skip, not after.
-- Include the object pointer (`%p`) if you suspect multiple instances.
+- Include the object pointer (`%p` / `ObjectIdentifier(self)`) if you suspect multiple instances.
 - Include the full chain state in one log line to correlate across async boundaries.
 
 Run the reproduction path. The first log that is **missing or has an unexpected value** is the failure point.
 
+### Confirming the root cause before fixing
+
+Do not touch code until the log evidence meets **all** of the following:
+- The same guard shows the abnormal value **stably across ≥3 consecutive runs** of the minimal reproduction path.
+- The root cause explains **every observed symptom** — including "why it works for other users / other rooms". A cause that explains only part of the symptoms is a false lead; keep instrumenting.
+
 ---
 
-## Phase 4 — Fix Patterns
+## Phase 3 — Fix Patterns
 
 Match the root cause to the appropriate fix:
 
 | Root Cause | Fix Pattern |
 |---|---|
-| Stale flag not cleared | Add reset call in `exitRoom`/`dealloc`/`viewWillDisappear`. Also reset at entry to be safe. |
+| Stale flag not cleared | Add reset call in `exitRoom`/`dealloc`/`deinit`/`viewWillDisappear`. Also reset at entry to be safe. |
 | Same-key early-exit in singleton | After the singleton's `setCurrent*` call, add an explicit `updateX:value:` force-refresh call. Do **not** modify the singleton's guard (it may exist for good reason). |
 | Async race (no retry) | Add a `pendingFlag`. Fast path sets it; slow path checks + consumes it. Reset `pendingFlag` on exit. |
 | Guard chain misconfiguration | Fix the setter of the failing guard; do not bypass the guard itself. |
-| Double execution | Trace all paths that trigger the feature. Ensure exactly one path is authoritative; comment out or remove the redundant one. |
+| Duplicate trigger paths | Trace all paths that trigger the feature. Ensure exactly one path is authoritative; comment out or remove the redundant one. |
 
 ---
 
-## Phase 5 — Verification
+## Phase 4 — Verification
 
-Test all 4 scenarios before closing:
+Test all 5 scenarios before closing:
 
 1. **Clean launch → first entry**: should work.
-2. **Exit → re-enter same session/room**: should work.
-3. **Switch to different session → come back**: should work.
+2. **Exit → re-enter same room**: should work.
+3. **Switch to different room → come back**: should work.
 4. **Other users' equivalent actions**: should still work (no regression).
+5. **Network timing flip**: repeat the path under weak network / airplane-mode-off recovery. A race-condition fix must hold under **both** fast and slow timing — local-only verification is exactly how race bugs "fixed" in dev reappear in production.
 
 For each scenario, confirm the feature fires **exactly once**.
 
 ---
 
-## Phase 6 — Cleanup
+## Phase 5 — Cleanup
 
 After verification:
-1. Remove all diagnostic `NSLog` added in Phase 3.
-2. Review the final diff: remove any imports, properties, or `@kWeakify/@kStrongify` that were only needed for the diagnostic path.
+1. Remove all diagnostic `NSLog`/`print` added in Phase 2.
+2. Review the final diff: remove any imports, properties, `@kWeakify`/`@kStrongify` (ObjC) or `[weak self]` captures (Swift) that were only needed for the diagnostic path.
 3. Confirm the only remaining changes are the minimal fix + explanatory comments.
 
 ---
